@@ -1,94 +1,106 @@
 import streamlit as st
 import pandas as pd
-from cot_reports import cot # مكتبة جلب البيانات الحالية
-import datetime
+import requests
+import io
 
-# إعداد واجهة التطبيق
-st.set_page_config(page_title="EUR FX COT Live Analyzer", layout="wide")
-st.title("📊 محلل بيانات COT الحي - اليورو (EUR FX)")
+# إعداد الصفحة
+st.set_page_config(page_title="EUR FX COT Tracker", layout="wide")
 
-# دالة لتنسيق الألوان
-def color_value(val):
-    color = "green" if val >= 0 else "red"
-    return f"<span style='color:{color}; font-weight:bold;'>{val:+,}</span>"
+st.title("🇪🇺 محلل التزام المتداولين (COT) لليورو")
 
-@st.cache_data(ttl=86400) # التخزين لمدة يوم (التقرير يصدر أسبوعياً)
-def fetch_live_data():
+@st.cache_data(ttl=3600)
+def get_live_cot_data():
+    # رابط البيانات المباشرة لعام 2026 من موقع CFTC (صيغة مضغوطة أو نصية)
+    # سنستخدم الرابط الذي يحتوي على بيانات السنة الحالية كاملة
+    url = "https://www.cftc.gov/dea/newcot/deahist2026.zip"
+    
     try:
-        # جلب بيانات العام الحالي (2026) من بورصة شيكاغو (CME)
-        df = cot.get_cot(year=2026, cot_report_type='legacy_fut')
-        
-        # تصفية البيانات لعملة اليورو فقط
-        # الاسم الرسمي في التقرير هو "EURO CURRENCY - CHICAGO MERCANTILE EXCHANGE"
-        eur_df = df[df['Market_and_Exchange_Names'].str.contains("EURO CURRENCY", na=False)].copy()
-        
-        # تحويل التاريخ وتنسيق الأعمدة الهامة
-        eur_df['Report_Date_as_MM_DD_YYYY'] = pd.to_datetime(eur_df['Report_Date_as_MM_DD_YYYY'])
-        eur_df = eur_df.sort_values('Report_Date_as_MM_DD_YYYY', ascending=False)
-        
-        # اختيار الأعمدة المطلوبة (Non-Commercial Long/Short)
-        final_df = eur_df[['Report_Date_as_MM_DD_YYYY', 'NonComm_Positions_Long_All', 'NonComm_Positions_Short_All']].copy()
-        final_df.columns = ['Date', 'Long', 'Short']
-        return final_df
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            from zipfile import ZipFile
+            with ZipFile(io.BytesIO(response.content)) as z:
+                # فتح ملف الـ CSV داخل الـ ZIP (عادة يكون ملف واحد)
+                filename = z.namelist()[0]
+                with z.open(filename) as f:
+                    df = pd.read_csv(f)
+            
+            # تصفية البيانات لليورو فقط
+            # الاسم الرسمي في التقارير: "EURO CURRENCY - CHICAGO MERCANTILE EXCHANGE"
+            eur_df = df[df['Market_and_Exchange_Names'].str.contains("EURO CURRENCY", na=False)].copy()
+            
+            # ترتيب البيانات حسب التاريخ (الأحدث أولاً)
+            eur_df['Report_Date_as_MM_DD_YYYY'] = pd.to_datetime(eur_df['Report_Date_as_MM_DD_YYYY'])
+            eur_df = eur_df.sort_values('Report_Date_as_MM_DD_YYYY', ascending=False)
+            
+            return eur_df
+        else:
+            return None
     except Exception as e:
-        st.error(f"حدث خطأ أثناء جلب البيانات الحية: {e}")
+        st.error(f"خطأ في الاتصال بموقع CFTC: {e}")
         return None
 
-# تنفيذ الجلب
-with st.spinner('جاري سحب أحدث البيانات من موقع CFTC...'):
-    df = fetch_live_data()
+# جلب البيانات
+df = get_live_cot_data()
 
 if df is not None and not df.empty:
-    # 1. الحسابات الحالية (أحدث أسبوع)
-    latest = df.iloc[0]
-    net_now = latest['Long'] - latest['Short']
+    # استخراج الأعمدة المطلوبة
+    # NonComm_Positions_Long_All = الشراء لغير التجاريين
+    # NonComm_Positions_Short_All = البيع لغير التجاريين
     
-    # 2. حساب التغير لـ 6 أسابيع (إذا توفرت البيانات)
+    latest = df.iloc[0]
+    
+    # 1. حساب الصافي الحالي
+    net_now = latest['NonComm_Positions_Long_All'] - latest['NonComm_Positions_Short_All']
+    net_color = "green" if net_now >= 0 else "red"
+    
+    # حساب فروقات 6 أسابيع
     if len(df) >= 7:
-        target_week = df.iloc[6] # الأسبوع السابع للمقارنة بالستة الماضية
-        long_diff = latest['Long'] - target_week['Long']
-        short_diff = latest['Short'] - target_week['Short']
-        prev_date = target_week['Date'].date()
+        past_6w = df.iloc[6]
+        long_diff = latest['NonComm_Positions_Long_All'] - past_6w['NonComm_Positions_Long_All']
+        short_diff = latest['NonComm_Positions_Short_All'] - past_6w['NonComm_Positions_Short_All']
     else:
         long_diff = short_diff = 0
-        prev_date = "غير متوفر"
 
-    # عرض النتائج في بطاقات علوية
-    st.subheader(f"📅 تقرير الأسبوع الحالي: {latest['Date'].date()}")
+    # العرض المرئي (Metrics)
+    st.info(f"آخر تحديث للتقرير: {latest['Report_Date_as_MM_DD_YYYY'].date()}")
     
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("صافي المراكز (Net)", f"{net_now:,}", delta_color="normal")
-        st.markdown(f"النتيجة: {color_value(net_now)}", unsafe_allow_html=True)
-        
-    with c2:
-        st.metric("تغير الشراء (6 أسابيع)", f"{long_diff:,}")
-        st.markdown(f"الفرق: {color_value(long_diff)}", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown(f"### صافي المراكز (Net)")
+        st.markdown(f"<h2 style='color:{net_color};'>{net_now:+,}</h2>", unsafe_allow_html=True)
+        st.caption("Long - Short")
 
-    with c3:
-        st.metric("تغير البيع (6 أسابيع)", f"{short_diff:,}")
-        st.markdown(f"الفرق: {color_value(short_diff)}", unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"### تغير الشراء (6 أسابيع)")
+        l_color = "green" if long_diff >= 0 else "red"
+        st.markdown(f"<h2 style='color:{l_color};'>{long_diff:+,}</h2>", unsafe_allow_html=True)
+
+    with col3:
+        st.markdown(f"### تغير البيع (6 أسابيع)")
+        s_color = "green" if short_diff >= 0 else "red"
+        st.markdown(f"<h2 style='color:{s_color};'>{short_diff:+,}</h2>", unsafe_allow_html=True)
 
     st.divider()
 
-    # 3. جدول المقارنة التاريخية
-    st.subheader("📜 سجل البيانات لآخر 10 أسابيع")
+    # المقارنة النهائية
+    st.subheader("🏁 الخلاصة الفنية")
+    final_net = long_diff - short_diff
+    final_color = "green" if final_net >= 0 else "red"
+    final_text = "قوة شرائية متزايدة" if final_net >= 0 else "قوة بيعية متزايدة"
     
-    # إضافة عمود الصافي للجدول
-    df['Net'] = df['Long'] - df['Short']
-    
-    # تنسيق الجدول للعرض بالألوان
-    display_df = df.head(10).copy()
-    st.dataframe(display_df.style.applymap(lambda x: 'color: green' if str(x).startswith('+') or (isinstance(x, (int, float)) and x > 0) else 'color: red', subset=['Net']))
+    st.markdown(f"""
+    <div style="padding:20px; border-radius:10px; background-color:#f0f2f6; border-left: 10px solid {final_color};">
+        <h3 style="color:{final_color}; margin:0;">{final_text}</h3>
+        <p style="color:black;">صافي التغير الإجمالي: {final_net:+,}</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # 4. خلاصة التحليل
-    st.subheader("💡 الملخص الفني")
-    if net_now > 0 and long_diff > 0:
-        st.success("النتيجة النهائية: صعودي (Bullish) - الحيتان يزيدون مراكز الشراء.")
-    elif net_now < 0 and short_diff > 0:
-        st.error("النتيجة النهائية: هبوطي (Bearish) - الحيتان يزيدون مراكز البيع.")
-    else:
-        st.warning("النتيجة النهائية: تذبذب أو جني أرباح - مراكز غير منتظمة.")
+    # جدول تفصيلي
+    with st.expander("شاهد سجل البيانات التاريخية"):
+        history = df[['Report_Date_as_MM_DD_YYYY', 'NonComm_Positions_Long_All', 'NonComm_Positions_Short_All']].copy()
+        history.columns = ['التاريخ', 'الشراء (Long)', 'البيع (Short)']
+        st.dataframe(history.head(10))
 
 else:
-    st.info("لم يتم العثور على بيانات للعام الحالي بعد، تأكد من تحديث السنة في الكود `year=2026` عند صدور أول تقرير.")
+    st.warning("⚠️ لا توجد بيانات متاحة حالياً لعام 2026. قد يكون التقرير لم يصدر بعد أو هناك صيانة في موقع CFTC.")
